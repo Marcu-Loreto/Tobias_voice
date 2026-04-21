@@ -1,0 +1,85 @@
+version: "3.7"
+services:
+  ## --------------------------- NOTURNA --------------------------- ##
+
+  noturna:
+    image: ghcr.io/marcu-loreto/tobias_voice:latest
+    ## Ou build local: descomente as 2 linhas abaixo e comente a linha image acima
+    # build:
+    #   context: .
+
+    volumes:
+      - noturna_data:/app/data
+      - noturna_logs:/app/logs
+      - noturna_certs:/app/.certs
+      - noturna_prompts:/app/prompts
+
+    networks:
+      - minha_rede
+
+    environment:
+      ## OpenAI (obrigatório)
+      - OPENAI_API_KEY=sk-proj-SUA_CHAVE_AQUI
+      - NOTURNA_MODEL=gpt-4o-mini
+
+      ## Vocal Bridge (voz)
+      - VOCAL_BRIDGE_API_KEY=vb_SUA_CHAVE_AQUI
+
+      ## OpenWeather (previsão do tempo)
+      - OPENWEATHER_API_KEY=SUA_CHAVE_AQUI
+
+      ## Google Workspace MCP (Gmail + Calendar)
+      - GOOGLE_OAUTH_CLIENT_ID=SUA_CLIENT_ID.apps.googleusercontent.com
+      - GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-SUA_SECRET
+      - USER_GOOGLE_EMAIL=seu@gmail.com
+      - OAUTHLIB_INSECURE_TRANSPORT=1
+
+      ## Evolution API (WhatsApp)
+      - EVOLUTION_API_URL=https://evolution.etechats.com.br
+      - EVOLUTION_API_KEY=SUA_EVOLUTION_KEY
+      - EVOLUTION_INSTANCE=NOTURNA
+
+      ## Groq STT (transcrição de áudio WhatsApp)
+      - GROQ_API_KEY=SUA_GROQ_KEY
+
+      ## Webhook (URL pública da Noturna para receber mensagens)
+      - WEBHOOK_URL=https://noturna.etechats.com.br
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - traefik.enable=1
+        - traefik.http.routers.noturna.rule=Host(`noturna.etechats.com.br`)
+        - traefik.http.routers.noturna.entrypoints=websecure
+        - traefik.http.routers.noturna.priority=1
+        - traefik.http.routers.noturna.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.noturna.service=noturna
+        - traefik.http.services.noturna.loadbalancer.server.port=8443
+        - traefik.http.services.noturna.loadbalancer.passHostHeader=true
+        - traefik.http.services.noturna.loadbalancer.server.scheme=https
+        - traefik.http.serversTransports.noturna.insecureSkipVerify=true
+
+## --------------------------- NOTURNA --------------------------- ##
+
+volumes:
+  noturna_data:
+    external: true
+    name: noturna_data
+  noturna_logs:
+    external: true
+    name: noturna_logs
+  noturna_certs:
+    external: true
+    name: noturna_certs
+  noturna_prompts:
+    external: true
+    name: noturna_prompts
+
+networks:
+  minha_rede:
+    external: true
+    name: minha_rede
