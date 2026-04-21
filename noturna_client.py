@@ -26,8 +26,10 @@ import requests as http_requests
 import uvicorn
 
 from mcp_bridge import MCPBridge
+from noturna_agent import NoturnaLocalAgent
+from whatsapp_bridge import WhatsAppBridge
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ── Logging setup ──
 LOG_DIR = Path(__file__).parent / "logs"
@@ -54,13 +56,40 @@ CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"
 
 mcp = MCPBridge()
+whatsapp = WhatsAppBridge()
+agent = NoturnaLocalAgent()
+
+
+async def _weather_tool(city: str) -> dict:
+    """Weather tool for the local agent."""
+    try:
+        resp = http_requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "pt_br"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        d = resp.json()
+        return {
+            "city": d.get("name", city),
+            "temp": d["main"]["temp"],
+            "feels_like": d["main"]["feels_like"],
+            "humidity": d["main"]["humidity"],
+            "description": d["weather"][0]["description"],
+            "wind_speed": d["wind"]["speed"],
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start MCP bridge on startup, stop on shutdown."""
+    """Start MCP bridge and local agent on startup."""
     logger.info("Starting Noturna Voice Client...")
     await mcp.start()
+    agent.mcp = mcp
+    agent.weather_fn = _weather_tool
+    agent.whatsapp = whatsapp
     logger.info("MCP Bridge started. Tools: %d", len(mcp.list_tools()))
     yield
     logger.info("Shutting down...")
@@ -204,6 +233,62 @@ async def call_mcp_tool(request: Request):
     return JSONResponse(content=result)
 
 
+@app.post("/api/chat")
+async def chat_text(request: Request):
+    """Local text chat with Noturna — works without Vocal Bridge."""
+    body = await request.json()
+    message = body.get("message", "")
+    session_id = body.get("session_id", "default")
+
+    if not message:
+        return JSONResponse(content={"error": "message is required"}, status_code=400)
+
+    logger.info("Text chat: %s", message[:100])
+    reply = await agent.chat(message, session_id)
+    logger.info("Text reply: %s", reply[:100])
+    return JSONResponse(content={"reply": reply, "session_id": session_id})
+
+
+@app.get("/api/chat/history")
+async def chat_history(session_id: str = "default"):
+    """Get conversation history for a session."""
+    messages = agent.memory.load_messages(session_id, limit=100)
+    # Filter to only user/assistant messages for display
+    history = [m for m in messages if m.get("role") in ("user", "assistant")]
+    return JSONResponse(content={"session_id": session_id, "messages": history})
+
+
+@app.get("/api/chat/sessions")
+async def chat_sessions():
+    """List all chat sessions."""
+    return JSONResponse(content={"sessions": agent.list_sessions()})
+
+
+@app.delete("/api/chat/history")
+async def clear_history(request: Request):
+    """Clear conversation history for a session."""
+    body = await request.json()
+    session_id = body.get("session_id", "default")
+    agent.clear_session(session_id)
+    logger.info("Cleared session: %s", session_id)
+    return JSONResponse(content={"ok": True})
+
+
+@app.post("/api/chat/save")
+async def save_voice_message(request: Request):
+    """Save a voice transcript message to persistent memory."""
+    body = await request.json()
+    role = body.get("role", "user")
+    content = body.get("content", "")
+    session_id = body.get("session_id", "default")
+
+    if content:
+        agent.memory.save_message(session_id, {"role": role, "content": content})
+        logger.info("Voice msg saved [%s]: %s — %s", session_id, role, content[:80])
+
+    return JSONResponse(content={"ok": True})
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -266,6 +351,18 @@ button{border:none;cursor:pointer;font-family:inherit;font-size:.95rem;border-ra
 #btn-clear{background:transparent;color:var(--dim);padding:12px;font-size:.85rem}
 #btn-clear:hover{color:var(--text)}
 
+#text-input-bar{background:var(--bg2);padding:10px 20px;display:flex;gap:10px;align-items:center;
+  border-top:1px solid #ffffff10;flex-shrink:0}
+#text-input{flex:1;background:var(--bg3);color:var(--text);border:1px solid #ffffff15;
+  border-radius:var(--radius);padding:12px 16px;font-family:inherit;font-size:.95rem;outline:none}
+#text-input:focus{border-color:var(--accent)}
+#text-input:disabled{opacity:.4}
+#btn-send{background:var(--accent);color:#fff;border:none;border-radius:var(--radius);
+  padding:12px 20px;font-weight:600;font-family:inherit;font-size:.95rem;cursor:pointer;
+  transition:all .2s}
+#btn-send:hover{filter:brightness(1.15)}
+#btn-send:disabled{opacity:.3;cursor:not-allowed}
+
 #device-select{background:var(--bg3);color:var(--text);border:1px solid #ffffff15;
   border-radius:8px;padding:8px 12px;font-size:.85rem;max-width:200px;
   font-family:inherit;outline:none}
@@ -302,7 +399,12 @@ button{border:none;cursor:pointer;font-family:inherit;font-size:.95rem;border-ra
 </div>
 
 <div id="transcript">
-  <div class="msg system">Clique em Conectar para falar com a Noturna</div>
+  <div class="msg system">Digite uma mensagem ou conecte para usar voz</div>
+</div>
+
+<div id="text-input-bar">
+  <input type="text" id="text-input" placeholder="Digite uma mensagem..." />
+  <button id="btn-send">Enviar</button>
 </div>
 
 <div id="controls">
@@ -325,6 +427,8 @@ const btnClear = $('#btn-clear');
 const statusDot = $('#status-dot');
 const statusText = $('#status-text');
 const deviceSelect = $('#device-select');
+const textInput = $('#text-input');
+const btnSend = $('#btn-send');
 
 let vb = null;
 let selectedDeviceId = '';
@@ -428,7 +532,7 @@ async function connect() {
         btnConnect.classList.add('connected');
         btnMic.disabled = false;
         btnMic.classList.add('active');
-        addMsg('system', 'Conectado à Noturna. Fale agora!');
+        addMsg('system', 'Conectado à Noturna. Fale ou digite!');
       } else if (state === 'connecting' || state === 'waiting_for_agent') {
         setStatus('connecting', state === 'waiting_for_agent' ? 'Aguardando agente...' : 'Conectando...');
       } else if (state === 'reconnecting') {
@@ -439,69 +543,33 @@ async function connect() {
     });
 
     vb.on('transcript', ({ role, text }) => {
-      addMsg(role === 'user' ? 'user' : 'agent', text);
+      // Only show user transcripts — agent responses come from our backend via aiAgentQuery
+      if (role === 'user') {
+        addMsg('user', text);
+      }
     });
 
     // Handle agent actions — including MCP tool calls
     vb.on('agentAction', async ({ action, payload }) => {
       if (action === 'heartbeat' || action === 'send_transcript') return;
-
-      if (action === 'call_tool' || action === 'mcp_call') {
-        addMsg('system', `🔧 Executando: ${payload?.tool || action}`);
-        try {
-          const res = await fetch('/api/mcp/call', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tool: payload.tool, arguments: payload.arguments || {} }),
-          });
-          const result = await res.json();
-          addMsg('system', `✅ ${JSON.stringify(result).substring(0, 300)}`);
-          if (vb.sendAction) vb.sendAction('tool_result', { tool: payload.tool, result });
-        } catch (err) {
-          addMsg('system', `❌ Erro: ${err.message}`);
-        }
-      } else if (action === 'get_weather' || action === 'weather') {
-        const city = payload?.city || 'São Paulo';
-        addMsg('system', `🌤️ Buscando previsão: ${city}`);
-        try {
-          const res = await fetch('/api/weather', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ city }),
-          });
-          const result = await res.json();
-          addMsg('system', `✅ ${result.city}: ${result.current?.temp}°C - ${result.current?.description}`);
-          if (vb.sendAction) vb.sendAction('weather_result', result);
-        } catch (err) {
-          addMsg('system', `❌ Erro weather: ${err.message}`);
-        }
-      } else {
-        addMsg('system', `Ação: ${action}`);
-      }
+      addMsg('system', `Ação VB: ${action}`);
     });
 
-    // Handle AI Agent queries via event listener
+    // AI Agent mode: VB does STT → sends here → we process → VB does TTS
     vb.on('aiAgentQuery', async ({ query, turnId }) => {
-      addMsg('system', `🔧 Noturna solicitou: ${query.substring(0, 150)}`);
       try {
-        let toolCall = null;
-        try { toolCall = JSON.parse(query); } catch {}
-
-        let response;
-        if (toolCall && toolCall.tool) {
-          const res = await fetch('/api/mcp/call', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(toolCall),
-          });
-          response = JSON.stringify(await res.json());
-          addMsg('system', `✅ ${response.substring(0, 300)}`);
-        } else {
-          response = `Ferramentas MCP disponíveis em /api/mcp/tools. Query: ${query}`;
-        }
-        if (vb.sendAIAgentResponse) vb.sendAIAgentResponse(turnId, response);
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: query }),
+        });
+        const data = await res.json();
+        const reply = data.reply || 'Desculpe, não consegui processar.';
+        addMsg('agent', reply);
+        if (vb.sendAIAgentResponse) vb.sendAIAgentResponse(turnId, reply);
       } catch (err) {
-        if (vb.sendAIAgentResponse) vb.sendAIAgentResponse(turnId, `Erro: ${err.message}`);
+        addMsg('system', `Erro: ${err.message}`);
+        if (vb.sendAIAgentResponse) vb.sendAIAgentResponse(turnId, 'Desculpe, houve um erro.');
       }
     });
 
@@ -564,15 +632,88 @@ async function toggleMic() {
   }
 }
 
+// ── Send text message ──
+async function sendText() {
+  const text = textInput.value.trim();
+  if (!text) return;
+
+  addMsg('user', text);
+  textInput.value = '';
+  textInput.disabled = true;
+  btnSend.disabled = true;
+
+  if (vb && vb.state === 'connected') {
+    // Voice mode: send via LiveKit data channel
+    try {
+      const msg = JSON.stringify({
+        type: 'client_action',
+        action: 'user_text_message',
+        payload: { text }
+      });
+      await vb.room?.localParticipant?.publishData(
+        new TextEncoder().encode(msg),
+        { reliable: true, topic: 'client_actions' }
+      );
+    } catch (err) {
+      addMsg('system', `Erro via voz, tentando local...`);
+      await sendToLocalAgent(text);
+    }
+  } else {
+    // Text mode: use local backend agent
+    await sendToLocalAgent(text);
+  }
+
+  textInput.disabled = false;
+  btnSend.disabled = false;
+  textInput.focus();
+}
+
+async function sendToLocalAgent(text) {
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+    const data = await res.json();
+    if (data.reply) {
+      addMsg('agent', data.reply);
+    } else if (data.error) {
+      addMsg('system', `Erro: ${data.error}`);
+    }
+  } catch (err) {
+    addMsg('system', `Erro no chat local: ${err.message}`);
+  }
+}
+
 // ── Events ──
 btnConnect.addEventListener('click', connect);
 btnMic.addEventListener('click', toggleMic);
+btnSend.addEventListener('click', sendText);
+textInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
+});
 btnClear.addEventListener('click', () => {
   transcript.innerHTML = '<div class="msg system">Histórico limpo</div>';
 });
 
+// ── Load history on startup ──
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/chat/history?session_id=default');
+    const data = await res.json();
+    if (data.messages && data.messages.length > 0) {
+      data.messages.forEach(m => {
+        addMsg(m.role === 'assistant' ? 'agent' : 'user', m.content);
+      });
+      addMsg('system', `${data.messages.length} mensagens restauradas`);
+    }
+  } catch {}
+}
+
 // ── Init ──
 loadDevices();
+loadHistory();
 </script>
 </body>
 </html>"""

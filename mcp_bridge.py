@@ -61,7 +61,7 @@ class GoogleWorkspaceMCP:
 
         try:
             self._process = subprocess.Popen(
-                ["workspace-mcp", "--tools", "gmail", "calendar", "--single-user"],
+                ["workspace-mcp", "--tools", "gmail", "calendar", "--single-user", "--tool-tier", "core"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -75,6 +75,13 @@ class GoogleWorkspaceMCP:
                 "capabilities": {},
                 "clientInfo": {"name": "noturna-bridge", "version": "1.0.0"},
             })
+
+            # Send initialized notification (required before tool calls)
+            await asyncio.sleep(1)
+            notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) + "\n"
+            self._process.stdin.write(notif.encode())
+            self._process.stdin.flush()
+            await asyncio.sleep(1)
 
             # List available tools
             result = await self._send_request("tools/list", {})
@@ -130,8 +137,11 @@ class GoogleWorkspaceMCP:
             "arguments": arguments,
         })
         if result:
-            return {"success": True, "result": result}
-        return {"success": False, "error": "Tool call failed"}
+            # Extract text from MCP content format
+            content = result.get("content", [])
+            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            return {"success": True, "result": "\n".join(texts) if texts else str(result)}
+        return {"success": False, "error": "Tool call failed or no response"}
 
     def get_tools(self) -> list[dict]:
         """Return the list of available tools."""
